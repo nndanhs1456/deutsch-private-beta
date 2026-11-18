@@ -54,6 +54,8 @@ export const LectureTranslatorView: React.FC<LectureTranslatorViewProps> = ({
   const [confirmClearOpen, setConfirmClearOpen] = useState<boolean>(false);
 
   const [isSummarizing, setIsSummarizing] = useState<boolean>(false);
+  const [summaryStatusText, setSummaryStatusText] = useState<string>('');
+  const [summaryError, setSummaryError] = useState<string>('');
   const [summaryData, setSummaryData] = useState<any>(null);
   const [summaryModalOpen, setSummaryModalOpen] = useState<boolean>(false);
 
@@ -431,24 +433,48 @@ export const LectureTranslatorView: React.FC<LectureTranslatorViewProps> = ({
   const handleFinishAndSummarize = async () => {
     if (segments.length === 0) return;
     setIsSummarizing(true);
+    setSummaryError('');
+    setSummaryStatusText('Đang phân tích và tóm tắt bài học...');
+
+    const retryDelays = [1500, 3000, 6000];
+    const slowTimer = setTimeout(() => {
+      setSummaryStatusText('Hệ thống bận, đang kết nối lại...');
+    }, 2000);
+
     try {
       const fullGerman = segments.map(s => s.de).join(' ');
-      const res = await fetch('/api/translate-lecture', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          germanText: fullGerman,
-          level: 'B2',
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Không thể tóm tắt bài học.');
+      const callSummary = () =>
+        fetch('/api/translate-lecture', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            germanText: fullGerman,
+            level: 'B2',
+          }),
+        });
+
+      let res = await callSummary();
+      let data = await res.json().catch(() => ({}));
+
+      if (!res.ok && res.status === 503 && !data?.retriedOnServer) {
+        setSummaryStatusText('Hệ thống bận, đang kết nối lại...');
+        for (const delayMs of retryDelays) {
+          await new Promise((r) => setTimeout(r, delayMs));
+          res = await callSummary();
+          data = await res.json().catch(() => ({}));
+          if (res.ok || res.status !== 503) break;
+        }
+      }
+
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}: Không thể tóm tắt bài học.`);
       setSummaryData(data);
       setSummaryModalOpen(true);
     } catch (err: any) {
-      // ignore
+      setSummaryError(String(err?.message || 'Không thể tóm tắt bài học lúc này.'));
     } finally {
+      clearTimeout(slowTimer);
       setIsSummarizing(false);
+      setSummaryStatusText('');
     }
   };
 
@@ -542,6 +568,32 @@ export const LectureTranslatorView: React.FC<LectureTranslatorViewProps> = ({
           </button>
         </div>
       </div>
+
+      {isSummarizing && summaryStatusText && (
+        <div
+          className={`flex items-center gap-2 rounded-xl border px-4 py-2.5 text-xs font-medium ${
+            summaryStatusText.includes('Hệ thống bận')
+              ? 'border-amber-500/35 bg-amber-500/10 text-amber-200'
+              : 'border-sky-500/30 bg-sky-500/10 text-sky-200'
+          }`}
+        >
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          <span>{summaryStatusText}</span>
+        </div>
+      )}
+
+      {!isSummarizing && summaryError && (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-2.5 text-xs text-rose-200">
+          <span>{summaryError}</span>
+          <button
+            type="button"
+            onClick={() => setSummaryError('')}
+            className="rounded px-2 py-0.5 text-rose-300 hover:bg-rose-500/20"
+          >
+            Đóng
+          </button>
+        </div>
+      )}
 
       {/* 3 Display Frames */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">

@@ -32,6 +32,101 @@ function getGenAI() {
   });
 }
 
+const GEMINI_RETRY_DELAYS_MS = [1500, 3000, 6000];
+
+function isGemini503Error(err: any): boolean {
+  const status = Number(err?.status || err?.code || err?.statusCode || err?.error?.code || 0);
+  if (status === 503) return true;
+  const msg = String(err?.message || err?.error?.message || '').toLowerCase();
+  const statusText = String(err?.error?.status || err?.statusText || '').toUpperCase();
+  return (
+    statusText === 'UNAVAILABLE' ||
+    msg.includes('503') ||
+    msg.includes('unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('service unavailable')
+  );
+}
+
+function isGemini404Error(err: any): boolean {
+  const status = Number(err?.status || err?.code || err?.error?.code || 0);
+  if (status === 404) return true;
+  const msg = String(err?.message || '').toLowerCase();
+  return msg.includes('not_found') || msg.includes('not found');
+}
+
+function sanitizeConfigForModel(modelName: string, baseConfig?: Record<string, any>) {
+  if (!baseConfig) return undefined;
+  const cfg: Record<string, any> = { ...baseConfig };
+  if (modelName.startsWith('gemini-2.5-')) {
+    delete cfg.thinkingConfig;
+  } else if (modelName === 'gemini-4-hydrogen' && cfg.thinkingConfig?.thinkingLevel === ThinkingLevel.MINIMAL) {
+    cfg.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+  }
+  return cfg;
+}
+
+async function generateWithRetryAndFallback<T = any>(params: {
+  primaryModels: string[];
+  fallbackModels: string[];
+  invoke: (modelName: string) => Promise<T>;
+  label?: string;
+}): Promise<{ response: T; model: string; usedFallback: boolean }> {
+  const { primaryModels, fallbackModels, invoke, label = 'Gemini' } = params;
+  let lastError: any = null;
+  let primaryRetryCount = 0;
+
+  for (const modelName of primaryModels) {
+    while (true) {
+      try {
+        const response = await invoke(modelName);
+        return { response, model: modelName, usedFallback: false };
+      } catch (err: any) {
+        lastError = err;
+        if (isGemini404Error(err)) {
+          break;
+        }
+        if (isGemini503Error(err)) {
+          if (primaryRetryCount < GEMINI_RETRY_DELAYS_MS.length) {
+            const waitMs = GEMINI_RETRY_DELAYS_MS[primaryRetryCount];
+            primaryRetryCount++;
+            console.warn(
+              `[${label}] Gemini 503 on ${modelName} — retry ${primaryRetryCount}/${GEMINI_RETRY_DELAYS_MS.length} after ${waitMs}ms`
+            );
+            await new Promise((r) => setTimeout(r, waitMs));
+            continue;
+          }
+          break;
+        }
+        throw err;
+      }
+    }
+    if (primaryRetryCount >= GEMINI_RETRY_DELAYS_MS.length && isGemini503Error(lastError)) {
+      break;
+    }
+  }
+
+  for (const fallbackModel of fallbackModels) {
+    try {
+      console.warn(`[${label}] Switching to fallback model: ${fallbackModel}`);
+      const response = await invoke(fallbackModel);
+      return { response, model: fallbackModel, usedFallback: true };
+    } catch (err: any) {
+      lastError = err;
+      if (isGemini503Error(err) || isGemini404Error(err)) {
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (lastError && typeof lastError === 'object') {
+    lastError.retriedOnServer = true;
+  }
+  throw lastError || new Error('Mô hình AI hiện đang quá tải tạm thời.');
+}
+
 // Helper to parse ISO 8601 duration (e.g. PT2H59M21S -> "2:59:21" & seconds)
 function parseIsoDuration(iso: string): { text: string; seconds: number } {
   const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
@@ -668,17 +763,15 @@ Nguyên tắc bắt buộc:
       };
 
       const promptContents = `Phân tích nội dung bài học dưới đây và trả về JSON theo đúng schema:\n\n${contentBlock}`;
-      const lectureSummaryModels = ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'];
-      let response: any = null;
-      let lastSummaryErr: any = null;
-
-      for (const modelName of lectureSummaryModels) {
-        try {
+      const { response } = await generateWithRetryAndFallback({
+        label: '/api/lecture-summary',
+        primaryModels: ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'],
+        fallbackModels: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
+        invoke: async (modelName) => {
           const isHydrogen = modelName === 'gemini-4-hydrogen';
-          response = await ai.models.generateContent({
-            model: modelName,
-            contents: promptContents,
-            config: isHydrogen
+          const config = sanitizeConfigForModel(
+            modelName,
+            isHydrogen
               ? {
                   systemInstruction,
                   thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
@@ -689,23 +782,15 @@ Nguyên tắc bắt buộc:
                   systemInstruction,
                   responseMimeType: 'application/json',
                   responseSchema: summarySchema,
-                },
+                }
+          );
+          return ai.models.generateContent({
+            model: modelName,
+            contents: promptContents,
+            config,
           });
-          break;
-        } catch (err: any) {
-          lastSummaryErr = err;
-          const errStatus = err?.status;
-          const msg = String(err?.message || '');
-          if (errStatus === 404 || msg.includes('NOT_FOUND') || msg.includes('not found')) {
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (!response) {
-        throw lastSummaryErr || new Error('Không nhận được phản hồi từ mô hình AI.');
-      }
+        },
+      });
 
       const rawJson = (response.text || '').trim();
       if (!rawJson) {
@@ -761,9 +846,17 @@ Nguyên tắc bắt buộc:
       });
     } catch (error: any) {
       console.error('Error in /api/lecture-summary:', error);
-      const status = error?.status && error.status >= 400 && error.status < 600 ? error.status : 500;
+      const status = isGemini503Error(error)
+        ? 503
+        : error?.status && error.status >= 400 && error.status < 600
+        ? error.status
+        : 500;
       return res.status(status).json({
-        error: error?.message || 'Không thể phân tích và tóm tắt bài học lúc này.',
+        error:
+          status === 503
+            ? 'Hệ thống AI đang quá tải tạm thời (503). Vui lòng thử lại sau giây lát.'
+            : error?.message || 'Không thể phân tích và tóm tắt bài học lúc này.',
+        retriedOnServer: Boolean(error?.retriedOnServer),
       });
     }
   });
@@ -795,47 +888,34 @@ Nguyên tắc bắt buộc:
               .join('\n')}\n\nCâu tiếng Đức MỚI cần dịch sang tiếng Việt:\n${sentence}`
           : `Dịch câu tiếng Đức sau sang tiếng Việt tự nhiên (chỉ trả về bản dịch tiếng Việt):\n${sentence}`;
 
-      const candidateModels = ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'];
-      let response: any = null;
-      let lastErr: any = null;
-
-      for (const modelName of candidateModels) {
-        try {
-          response = await ai.models.generateContent({
-            model: modelName,
-            contents: userPrompt,
-            config: {
-              systemInstruction,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-              temperature: 0.2,
-            },
-          });
-          break;
-        } catch (err: any) {
-          lastErr = err;
-          const msg = String(err?.message || '');
-          if (err?.status === 400 && (msg.includes('thinking') || msg.includes('system_instruction'))) {
-            try {
-              response = await ai.models.generateContent({
+      const { response } = await generateWithRetryAndFallback({
+        label: '/api/translate-live',
+        primaryModels: ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'],
+        fallbackModels: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
+        invoke: async (modelName) => {
+          try {
+            return await ai.models.generateContent({
+              model: modelName,
+              contents: userPrompt,
+              config: sanitizeConfigForModel(modelName, {
+                systemInstruction,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+                temperature: 0.2,
+              }),
+            });
+          } catch (err: any) {
+            const msg = String(err?.message || '');
+            if (err?.status === 400 && (msg.includes('thinking') || msg.includes('system_instruction'))) {
+              return await ai.models.generateContent({
                 model: modelName,
                 contents: `${systemInstruction}\n\n${userPrompt}`,
                 config: { temperature: 0.2 },
               });
-              break;
-            } catch (retryErr: any) {
-              lastErr = retryErr;
             }
+            throw err;
           }
-          if (err?.status === 404 || msg.includes('NOT_FOUND') || msg.includes('not found')) {
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (!response) {
-        throw lastErr || new Error('Không nhận được phản hồi dịch.');
-      }
+        },
+      });
 
       const rawTranslation = String(response.text || '')
         .trim()
@@ -850,9 +930,14 @@ Nguyên tắc bắt buộc:
       return res.json({ translation: rawTranslation });
     } catch (error: any) {
       console.error('Error in /api/translate-live:', error);
-      const status = error?.status && error.status >= 400 && error.status < 600 ? error.status : 500;
+      const status = isGemini503Error(error)
+        ? 503
+        : error?.status && error.status >= 400 && error.status < 600
+        ? error.status
+        : 500;
       return res.status(status).json({
         error: error?.message || 'Không thể dịch theo ngữ cảnh lúc này.',
+        retriedOnServer: Boolean(error?.retriedOnServer),
       });
     }
   });
@@ -889,50 +974,40 @@ Nguyên tắc bắt buộc:
         ? `Đoạn tiếng Việt liền trước (chỉ để nối mạch văn tự nhiên, KHÔNG dịch hay lặp lại):\n${prevViContext}\n\nCụm câu tiếng Đức MỚI cần biên tập thành đoạn văn xuôi tiếng Việt:\n${combinedGerman}`
         : `Biên tập cụm câu tiếng Đức sau thành 1 đoạn văn xuôi tiếng Việt mạch lạc, tự nhiên:\n${combinedGerman}`;
 
-      const candidateModels = ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'];
-      let response: any = null;
-      let lastErr: any = null;
-
-      for (const modelName of candidateModels) {
-        try {
-          const isFlashLite = modelName.includes('flash-lite');
-          response = await ai.models.generateContent({
-            model: modelName,
-            contents: userPrompt,
-            config: isFlashLite
-              ? {
-                  systemInstruction,
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-                }
-              : {
-                  systemInstruction,
-                },
-          });
-          break;
-        } catch (err: any) {
-          lastErr = err;
-          const msg = String(err?.message || '');
-          if (err?.status === 400 && (msg.includes('thinking') || msg.includes('system_instruction'))) {
-            try {
-              response = await ai.models.generateContent({
+      const { response } = await generateWithRetryAndFallback({
+        label: '/api/translate-batch',
+        primaryModels: ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'],
+        fallbackModels: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
+        invoke: async (modelName) => {
+          const isFlashLite = modelName.includes('flash-lite') && !modelName.startsWith('gemini-2.5-');
+          try {
+            return await ai.models.generateContent({
+              model: modelName,
+              contents: userPrompt,
+              config: sanitizeConfigForModel(
+                modelName,
+                isFlashLite
+                  ? {
+                      systemInstruction,
+                      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+                    }
+                  : {
+                      systemInstruction,
+                    }
+              ),
+            });
+          } catch (err: any) {
+            const msg = String(err?.message || '');
+            if (err?.status === 400 && (msg.includes('thinking') || msg.includes('system_instruction'))) {
+              return await ai.models.generateContent({
                 model: modelName,
                 contents: `${systemInstruction}\n\n${userPrompt}`,
               });
-              break;
-            } catch (retryErr: any) {
-              lastErr = retryErr;
             }
+            throw err;
           }
-          if (err?.status === 404 || msg.includes('NOT_FOUND') || msg.includes('not found')) {
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (!response) {
-        throw lastErr || new Error('Không nhận được phản hồi biên tập đoạn văn.');
-      }
+        },
+      });
 
       const paragraph = String(response.text || '')
         .trim()
@@ -948,9 +1023,14 @@ Nguyên tắc bắt buộc:
       return res.json({ paragraph });
     } catch (error: any) {
       console.error('Error in /api/translate-batch:', error);
-      const status = error?.status && error.status >= 400 && error.status < 600 ? error.status : 500;
+      const status = isGemini503Error(error)
+        ? 503
+        : error?.status && error.status >= 400 && error.status < 600
+        ? error.status
+        : 500;
       return res.status(status).json({
         error: error?.message || 'Không thể biên tập đoạn văn tiếng Việt lúc này.',
+        retriedOnServer: Boolean(error?.retriedOnServer),
       });
     }
   });
@@ -991,44 +1071,38 @@ Nguyên tắc bắt buộc:
         required: ['title', 'summaryVi', 'keyVocab'],
       };
 
-      const candidateModels = ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'];
-      let response: any = null;
-      let lastErr: any = null;
-
-      for (const modelName of candidateModels) {
-        try {
-          response = await ai.models.generateContent({
+      const { response } = await generateWithRetryAndFallback({
+        label: '/api/translate-lecture',
+        primaryModels: ['gemini-3.5-flash-lite-preview', 'gemini-3.5-flash-lite', 'gemini-4-hydrogen'],
+        fallbackModels: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
+        invoke: async (modelName) =>
+          ai.models.generateContent({
             model: modelName,
             contents: `Trình độ mục tiêu: ${level}\n\nNội dung bài giảng tiếng Đức:\n${germanText}`,
-            config: {
+            config: sanitizeConfigForModel(modelName, {
               systemInstruction:
                 'Bạn là trợ lý học tiếng Đức SLA. Hãy tóm tắt bài giảng tiếng Đức bằng tiếng Việt súc tích và trích xuất 5–10 từ vựng/thuật ngữ quan trọng nhất kèm mạo từ (der/die/das nếu là danh từ), nghĩa tiếng Việt và câu ví dụ.',
               responseMimeType: 'application/json',
               responseSchema: lectureSchema,
-            },
-          });
-          break;
-        } catch (err: any) {
-          lastErr = err;
-          const msg = String(err?.message || '');
-          if (err?.status === 404 || msg.includes('NOT_FOUND') || msg.includes('not found')) {
-            continue;
-          }
-          throw err;
-        }
-      }
-
-      if (!response) {
-        throw lastErr || new Error('Không nhận được phản hồi tóm tắt bài giảng.');
-      }
+            }),
+          }),
+      });
 
       const parsed = JSON.parse(String(response.text || '{}').trim());
       return res.json(parsed);
     } catch (error: any) {
       console.error('Error in /api/translate-lecture:', error);
-      const status = error?.status && error.status >= 400 && error.status < 600 ? error.status : 500;
+      const status = isGemini503Error(error)
+        ? 503
+        : error?.status && error.status >= 400 && error.status < 600
+        ? error.status
+        : 500;
       return res.status(status).json({
-        error: error?.message || 'Không thể tóm tắt bài học lúc này.',
+        error:
+          status === 503
+            ? 'Hệ thống AI đang quá tải tạm thời (503). Vui lòng thử lại sau giây lát.'
+            : error?.message || 'Không thể tóm tắt bài học lúc này.',
+        retriedOnServer: Boolean(error?.retriedOnServer),
       });
     }
   });
@@ -1052,25 +1126,36 @@ Nguyên tắc bắt buộc:
         },
       };
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-transcribe',
-        contents: {
-          parts: [
-            audioPart,
-            {
-              text: 'Transcribe the spoken German audio accurately into clean German sentences. Return only the transcribed German text without timestamps, notes, or explanations.',
+      const { response } = await generateWithRetryAndFallback({
+        label: '/api/transcribe-audio',
+        primaryModels: ['gemini-3.5-transcribe'],
+        fallbackModels: ['gemini-2.5-flash'],
+        invoke: async (modelName) =>
+          ai.models.generateContent({
+            model: modelName,
+            contents: {
+              parts: [
+                audioPart,
+                {
+                  text: 'Transcribe the spoken German audio accurately into clean German sentences. Return only the transcribed German text without timestamps, notes, or explanations.',
+                },
+              ],
             },
-          ],
-        },
+          }),
       });
 
       const transcript = (response.text || '').trim();
       return res.json({ transcript });
     } catch (error: any) {
       console.error('Error in /api/transcribe-audio:', error);
-      const status = error?.status && error.status >= 400 && error.status < 600 ? error.status : 500;
+      const status = isGemini503Error(error)
+        ? 503
+        : error?.status && error.status >= 400 && error.status < 600
+        ? error.status
+        : 500;
       return res.status(status).json({
         error: error?.message || 'Không thể phiên âm đoạn ghi âm lúc này.',
+        retriedOnServer: Boolean(error?.retriedOnServer),
       });
     }
   });
@@ -1137,11 +1222,15 @@ Nguyên tắc bắt buộc:
 
       const roleInstructions: Record<string, string> = {
         tutor:
-          'Bạn là Gia sư Tiếng Đức SLA của DeutschPrivate dành cho học viên Việt Nam (A2–C1). Giải thích ngữ pháp, mạo từ der/die/das, trật tự từ và từ vựng bằng tiếng Việt rõ ràng, súc tích, kèm ví dụ tiếng Đức chuẩn xác và bản dịch tiếng Việt.',
+          'Bạn là một người bạn học / đồng nghiệp bản xứ Đức thân thiện, hướng dẫn tiếng Đức trực tiếp, tự nhiên như đang trò chuyện hàng ngày với người Việt (A2–C1). ' +
+          'QUY TẮC ĐỊNH DẠNG BẮT BUỘC:\n' +
+          '- Tuyệt đối KHÔNG dùng tiêu đề lớn (#, ##, ###), KHÔNG chia thành các mục kiểu giáo án (như 1. Thông tin từ vựng, 2. Cách dùng thực tế, 3. Lưu ý) và KHÔNG giải thích dài dòng rập khuôn.\n' +
+          '- Khi người dùng hỏi một từ hoặc cụm từ tiếng Đức (ví dụ: "profie"), hãy trả lời ngắn gọn thành 2–3 dòng súc tích: sửa chính tả (nếu sai) + ghi thẳng dạng chuẩn kèm mạo từ/số nhiều (ví dụ: der Profi, die Profis), giải thích nghĩa tiếng Việt tự nhiên trong 1 câu, và đưa 1–2 câu ví dụ giao tiếp thực tế (kèm dịch nghĩa) ngay bên dưới.\n' +
+          '- Với câu hỏi ngữ pháp hoặc diễn đạt, trả lời trực tiếp vào trọng tâm, ngắn gọn, tự nhiên kèm ví dụ thực tế.',
         partner:
-          'Du bist ein freundlicher deutscher Gesprächspartner für Lernende auf Niveau B1–B2. Antworte überwiegend auf natürlichem Alltagsdeutsch in kurzen, klaren Sätzen und stelle am Ende eine passende Rückfrage. Wenn der Lernende einen Fehler macht, füge am Ende in Klammern eine kurze, höfliche Korrektur auf Vietnamesisch hinzu.',
+          'Du bist ein freundlicher deutscher Gesprächspartner für Lernende auf Niveau B1–B2. Antworte überwiegend auf natürlichem Alltagsdeutsch in kurzen, klaren Sätzen (ohne Markdown-Überschriften #, ##, ### oder nummerierte Listen) und stelle am Ende eine passende Rückfrage. Wenn der Lernende einen Fehler macht, füge am Ende in Klammern eine kurze, höfliche Korrektur auf Vietnamesisch hinzu.',
         exam:
-          'Bạn là Huấn luyện viên luyện thi Goethe-Zertifikat & telc (B1–C1). Hỗ trợ học viên luyện Schreiben và Sprechen bằng các mẫu câu Redemittel chuẩn kỳ thi, sửa lỗi câu chi tiết và chấm điểm theo tiêu chí ngữ pháp - từ vựng - mạch lạc.',
+          'Bạn là Huấn luyện viên luyện thi Goethe-Zertifikat & telc (B1–C1). Hỗ trợ học viên luyện Schreiben và Sprechen bằng các mẫu câu Redemittel chuẩn kỳ thi, sửa lỗi câu trực tiếp và ngắn gọn. Tuyệt đối KHÔNG dùng tiêu đề lớn (#, ##, ###) hay chia mục giáo án rườm rà.',
       };
 
       const baseInstruction = roleInstructions[String(roleKey || 'tutor')] || roleInstructions.tutor;
@@ -1158,9 +1247,6 @@ Nguyên tắc bắt buộc:
               .map((r, i) => `${i + 1}. ${r}`)
               .join('\n')}`
           : baseInstruction;
-
-      const candidateModels = ['gemini-3.1-flash-lite-preview', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
-      let activeModel = candidateModels[0];
 
       const sanitized = messages
         .map((m: any) => ({
@@ -1239,41 +1325,26 @@ Nguyên tắc bắt buộc:
         }
       };
 
-      let response;
-      const retryDelays = [700, 1400];
-      for (const modelName of candidateModels) {
-        activeModel = modelName;
-        let notFound = false;
-        for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
-          try {
-            response = await invokeGeminiChat(modelName);
-            break;
-          } catch (err: any) {
-            const code = err?.status;
-            if (code === 404) {
-              notFound = true;
-              break;
-            }
-            const isTransient = code === 503 || String(err?.message || '').includes('UNAVAILABLE');
-            if (isTransient && attempt < retryDelays.length) {
-              await new Promise((r) => setTimeout(r, retryDelays[attempt]));
-              continue;
-            }
-            throw err;
-          }
-        }
-        if (response || !notFound) break;
-      }
+      const { response, model: activeModel, usedFallback } = await generateWithRetryAndFallback({
+        label: '/api/chat',
+        primaryModels: ['gemini-3.1-flash-lite-preview', 'gemini-3.1-flash-lite', 'gemini-4-hydrogen'],
+        fallbackModels: ['gemini-2.5-flash-lite', 'gemini-2.5-flash'],
+        invoke: invokeGeminiChat,
+      });
 
       const reply = (response?.text || '').trim();
       if (!reply) {
         return res.status(502).json({ error: 'Mô hình AI không trả về nội dung.' });
       }
 
-      return res.json({ reply, model: activeModel });
+      return res.json({ reply, model: activeModel, usedFallback });
     } catch (error: any) {
       console.error('Error in /api/chat:', error);
-      const status = error?.status && error.status >= 400 && error.status < 600 ? error.status : 500;
+      const status = isGemini503Error(error)
+        ? 503
+        : error?.status && error.status >= 400 && error.status < 600
+        ? error.status
+        : 500;
       let cleanMsg = String(error?.message || 'Không thể kết nối Trợ lý AI lúc này.');
       if (cleanMsg.startsWith('{')) {
         try {
@@ -1286,6 +1357,7 @@ Nguyên tắc bắt buộc:
           status === 503
             ? 'Mô hình AI hiện đang quá tải tạm thời. Vui lòng thử gửi lại sau vài giây.'
             : cleanMsg,
+        retriedOnServer: Boolean(error?.retriedOnServer),
       });
     }
   });

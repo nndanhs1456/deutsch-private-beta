@@ -73,6 +73,7 @@ export const GeminiChatView: React.FC<GeminiChatViewProps> = ({ compactPopup = f
   ]);
   const [inputText, setInputText] = useState<string>('');
   const [isSending, setIsSending] = useState<boolean>(false);
+  const [sendingStatus, setSendingStatus] = useState<string>('Đang phản hồi (Gemini 3.1 Flash Lite)...');
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [errorDetail, setErrorDetail] = useState<string>('');
   const threadEndRef = useRef<HTMLDivElement | null>(null);
@@ -186,7 +187,25 @@ export const GeminiChatView: React.FC<GeminiChatViewProps> = ({ compactPopup = f
     if (!overrideText) setInputText('');
     setErrorMsg('');
     setErrorDetail('');
+    setSendingStatus('Đang phản hồi (Gemini 3.1 Flash Lite)...');
     setIsSending(true);
+
+    const retryDelays = [1500, 3000, 6000];
+    const is503Status = (status: number, detail: string) => {
+      const lower = String(detail || '').toLowerCase();
+      return (
+        status === 503 ||
+        lower.includes('503') ||
+        lower.includes('unavailable') ||
+        lower.includes('high demand') ||
+        lower.includes('overloaded') ||
+        lower.includes('quá tải')
+      );
+    };
+
+    const slowTimer = setTimeout(() => {
+      setSendingStatus('Hệ thống bận, đang kết nối lại...');
+    }, 2000);
 
     try {
       // Sliding window: only send up to the 10 most recent messages
@@ -195,17 +214,30 @@ export const GeminiChatView: React.FC<GeminiChatViewProps> = ({ compactPopup = f
         .slice(-10)
         .map((m) => ({ role: m.role, text: m.text }));
 
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: apiMessages,
-          roleKey,
-          customInstructions: instructionsEnabled ? instructionsList : [],
-        }),
-      });
+      const callApiChat = () =>
+        fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: apiMessages,
+            roleKey,
+            customInstructions: instructionsEnabled ? instructionsList : [],
+          }),
+        });
 
-      const data = await res.json().catch(() => ({}));
+      let res = await callApiChat();
+      let data = await res.json().catch(() => ({}));
+
+      if (!res.ok && is503Status(res.status, String(data?.error || '')) && !data?.retriedOnServer) {
+        setSendingStatus('Hệ thống bận, đang kết nối lại...');
+        for (const delayMs of retryDelays) {
+          await new Promise((r) => setTimeout(r, delayMs));
+          res = await callApiChat();
+          data = await res.json().catch(() => ({}));
+          if (res.ok || !is503Status(res.status, String(data?.error || ''))) break;
+        }
+      }
+
       if (res.ok && data?.reply) {
         setMessages((prev) => [
           ...prev,
@@ -221,37 +253,66 @@ export const GeminiChatView: React.FC<GeminiChatViewProps> = ({ compactPopup = f
       const serverDetail = String(data?.error || data?.code || res.statusText || 'Unknown error');
       const clientKey = getGeminiApiKey();
 
-      // Fallback trực tiếp nếu route /api/chat không tồn tại (404) hoặc server chưa nạp key nhưng client đã ánh xạ qua Vite define
-      if (clientKey && (res.status === 404 || /missing api key/i.test(serverDetail))) {
-        const directRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key=${encodeURIComponent(clientKey)}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: ROLE_CONFIG[roleKey].desc }] },
-              contents: apiMessages.map((m) => ({
-                role: m.role === 'model' ? 'model' : 'user',
-                parts: [{ text: m.text }],
-              })),
-            }),
-          }
-        );
-        const directData = await directRes.json().catch(() => ({}));
-        const directReply = directData?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (directRes.ok && directReply) {
-          setMessages((prev) => [
-            ...prev,
+      // Fallback trực tiếp nếu route /api/chat không tồn tại (404), server chưa nạp key, hoặc 503
+      if (clientKey && (res.status === 404 || /missing api key/i.test(serverDetail) || is503Status(res.status, serverDetail))) {
+        const directPrimary = ['gemini-3.1-flash-lite-preview'];
+        const directFallbacks = ['gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+        const invokeDirect = async (modelName: string) => {
+          const r = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(clientKey)}`,
             {
-              id: `model-${Date.now()}`,
-              role: 'model',
-              text: String(directReply).trim(),
-            },
-          ]);
-          return;
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: ROLE_CONFIG[roleKey].desc }] },
+                contents: apiMessages.map((m) => ({
+                  role: m.role === 'model' ? 'model' : 'user',
+                  parts: [{ text: m.text }],
+                })),
+              }),
+            }
+          );
+          const d = await r.json().catch(() => ({}));
+          const replyText = d?.candidates?.[0]?.content?.parts?.[0]?.text;
+          return { ok: r.ok && Boolean(replyText), status: r.status, replyText, errMsg: d?.error?.message || r.statusText || 'API Error' };
+        };
+
+        let lastDirect = { status: res.status, errMsg: serverDetail };
+        // If /api/chat already retried 503 on server, jump directly to stable fallback models; otherwise retry primary 3x
+        if (!data?.retriedOnServer) {
+          for (const modelName of directPrimary) {
+            let result = await invokeDirect(modelName);
+            if (result.ok) {
+              setMessages((prev) => [...prev, { id: `model-${Date.now()}`, role: 'model', text: String(result.replyText).trim() }]);
+              return;
+            }
+            lastDirect = { status: result.status, errMsg: result.errMsg };
+            if (is503Status(result.status, result.errMsg)) {
+              setSendingStatus('Hệ thống bận, đang kết nối lại...');
+              for (const delayMs of retryDelays) {
+                await new Promise((r) => setTimeout(r, delayMs));
+                result = await invokeDirect(modelName);
+                if (result.ok) {
+                  setMessages((prev) => [...prev, { id: `model-${Date.now()}`, role: 'model', text: String(result.replyText).trim() }]);
+                  return;
+                }
+                lastDirect = { status: result.status, errMsg: result.errMsg };
+                if (!is503Status(result.status, result.errMsg)) break;
+              }
+            }
+          }
         }
-        const directErr = directData?.error?.message || directRes.statusText || 'API Error';
-        throw new Error(`HTTP ${directRes.status} — ${directErr}`);
+
+        setSendingStatus('Hệ thống bận, đang kết nối lại...');
+        for (const fbModel of directFallbacks) {
+          const fbRes = await invokeDirect(fbModel);
+          if (fbRes.ok) {
+            setMessages((prev) => [...prev, { id: `model-${Date.now()}`, role: 'model', text: String(fbRes.replyText).trim() }]);
+            return;
+          }
+          lastDirect = { status: fbRes.status, errMsg: fbRes.errMsg };
+        }
+        throw new Error(`HTTP ${lastDirect.status} — ${lastDirect.errMsg}`);
       }
 
       const errCodeLabel = !clientKey && /missing api key/i.test(serverDetail)
@@ -263,6 +324,7 @@ export const GeminiChatView: React.FC<GeminiChatViewProps> = ({ compactPopup = f
       setErrorMsg('Không thể nhận phản hồi từ Gia sư AI.');
       setErrorDetail(detail);
     } finally {
+      clearTimeout(slowTimer);
       setIsSending(false);
     }
   };
@@ -396,9 +458,15 @@ export const GeminiChatView: React.FC<GeminiChatViewProps> = ({ compactPopup = f
           })}
 
           {isSending && (
-            <div className="flex items-center gap-2 text-xs text-slate-400">
-              <Bot className="h-4 w-4 text-emerald-400" />
-              <span>Đang phản hồi (Gemini 3.1 Flash Lite)...</span>
+            <div
+              className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors ${
+                sendingStatus.includes('Hệ thống bận')
+                  ? 'border-amber-500/35 bg-amber-500/10 text-amber-200'
+                  : 'border-sky-500/25 bg-sky-500/10 text-sky-300'
+              }`}
+            >
+              <Bot className={`h-4 w-4 ${sendingStatus.includes('Hệ thống bận') ? 'text-amber-300 animate-pulse' : 'text-emerald-400'}`} />
+              <span>{sendingStatus}</span>
             </div>
           )}
 
