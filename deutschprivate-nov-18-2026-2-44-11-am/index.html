@@ -965,6 +965,15 @@
             </button>
           </div>
 
+          <!-- Thông báo lỗi / trạng thái quyền Micro rõ ràng cho Mobile & Desktop -->
+          <div id="micPermissionAlert" style="display: none; margin-top: 14px; padding: 12px 16px; border-radius: 14px; background: rgba(239, 68, 68, 0.16); border: 1px solid rgba(239, 68, 68, 0.42); color: #fecdd3; font-size: 0.88rem; line-height: 1.5; align-items: flex-start; gap: 10px;">
+            <i class="fa-solid fa-circle-exclamation" style="color: #f87171; margin-top: 3px; flex-shrink: 0;"></i>
+            <div id="micPermissionAlertText" style="flex: 1;"></div>
+            <button onclick="document.getElementById('micPermissionAlert').style.display='none'" style="background: transparent; border: none; color: #fca5a5; cursor: pointer; font-size: 1rem; padding: 0 4px;" title="Đóng thông báo">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
+
           <!-- KHUNG TỔNG KẾT THÔNG MINH 3 PHẦN & CẢNH BÁO KIỂM TRA -->
           <div id="lectureSummaryBox" class="liquid-glass" style="display: none; margin-top: 20px; padding: 22px; border: 1px solid rgba(16, 185, 129, 0.35); background: rgba(6, 78, 59, 0.18);">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 14px;">
@@ -2222,109 +2231,356 @@
     }
 
     // ==========================================
-    // 4. LIVE CLASSROOM SPEECH-TO-TEXT & TRANSLATION
+    // 4. LIVE CLASSROOM SPEECH-TO-TEXT & TRANSLATION (MOBILE + DESKTOP OPTIMIZED)
     // ==========================================
+    let isListeningRef = false;
     let isClassroomListening = false;
     let recognition = null;
     let lectureHistory = [];
+    let restartTimeoutId = null;
+    let interimPauseTimerId = null;
+    let currentInterimRaw = '';
+    let flushedInterimPrefix = '';
+    let lastCommittedNorm = '';
+    let lastCommittedAt = 0;
+
+    // Hàng đợi dịch FIFO tuần tự giúp không rớt câu và hiển thị đúng thứ tự
+    const translationQueue = [];
+    let isProcessingQueue = false;
+    let liveSessionCounter = 0;
+
     const EXAM_KEYWORDS = ["prüfung", "test", "klausur", "aufgabe", "hausaufgabe", "abgabe", "termin", "wichtig", "beachten", "wiederholen", "noten", "vorbereitung"];
 
-    function initSpeechRecognition() {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SpeechRecognition) {
-        alert("Trình duyệt không hỗ trợ Web Speech API. Hãy dùng Microsoft Edge hoặc Google Chrome!");
-        return false;
-      }
-      recognition = new SpeechRecognition();
-      recognition.lang = 'de-DE';
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.maxAlternatives = 1;
-
-      const liveBadge = document.getElementById('speechLiveBadge');
-      const interimBox = document.getElementById('interimSpeechDisplay');
-
-      recognition.onstart = function() {
-        isClassroomListening = true;
-        document.getElementById('micLed').style.background = '#10b981';
-        document.getElementById('micStatusText').innerText = 'Đang nghe giảng (de-DE)...';
-        document.getElementById('recBtnText').innerText = 'Tạm dừng nghe';
-        if (liveBadge) liveBadge.style.display = 'inline-flex';
-      };
-
-      recognition.onresult = function(event) {
-        let interimText = '';
-        let finalText = '';
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalText += transcript;
-          } else {
-            interimText += transcript;
-          }
-        }
-
-        // Hiển thị trực tiếp câu giáo viên đang nói dở (interim real-time)
-        if (interimBox) {
-          if (interimText.trim()) {
-            interimBox.innerText = `Đang nghe: "${interimText}"...`;
-            interimBox.style.display = 'block';
-          } else {
-            interimBox.style.display = 'none';
-          }
-        }
-
-        // Khi câu nói đã hoàn chỉnh (isFinal): lưu và dịch tức thì
-        if (finalText.trim()) {
-          if (interimBox) interimBox.style.display = 'none';
-          appendAndTranslateLectureSentence(finalText.trim());
-        }
-      };
-
-      recognition.onerror = function(event) {
-        console.warn("Speech recognition error:", event.error);
-        if (event.error === 'not-allowed') {
-          alert("Vui lòng cấp quyền truy cập Microphone cho ứng dụng trong trình duyệt!");
-          isClassroomListening = false;
-        }
-      };
-
-      recognition.onend = function() {
-        if (isClassroomListening) {
-          // Tự động kích hoạt lại nhanh chóng (keep-alive) không để gián đoạn buổi học
-          setTimeout(() => {
-            if (isClassroomListening) {
-              try { recognition.start(); } catch(e) {}
-            }
-          }, 250);
-        } else {
-          if (liveBadge) liveBadge.style.display = 'none';
-          if (interimBox) interimBox.style.display = 'none';
-        }
-      };
-      return true;
+    function escapeHtmlSafe(str) {
+      return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
 
-    function toggleClassroomListen() {
-      if (!recognition && !initSpeechRecognition()) return;
+    function showMicAlert(message) {
+      const alertBox = document.getElementById('micPermissionAlert');
+      const alertText = document.getElementById('micPermissionAlertText');
+      if (alertBox && alertText) {
+        alertText.textContent = message;
+        alertBox.style.display = 'flex';
+      }
+      if (typeof showAppToast === 'function') {
+        showAppToast(message, 'removed');
+      }
+    }
+
+    function hideMicAlert() {
+      const alertBox = document.getElementById('micPermissionAlert');
+      if (alertBox) alertBox.style.display = 'none';
+    }
+
+    function setMicUiActive(active, statusLabel) {
+      isClassroomListening = active;
+      const led = document.getElementById('micLed');
+      const statusText = document.getElementById('micStatusText');
+      const btnText = document.getElementById('recBtnText');
+      const btn = document.getElementById('btnToggleRec');
       const liveBadge = document.getElementById('speechLiveBadge');
       const interimBox = document.getElementById('interimSpeechDisplay');
 
-      if (!isClassroomListening) {
+      if (led) led.style.background = active ? '#10b981' : '#64748b';
+      if (statusText) statusText.innerText = statusLabel || (active ? 'Đang nghe giảng (de-DE)...' : 'Đã tạm dừng');
+      if (btnText) btnText.innerText = active ? 'Tạm dừng nghe' : 'Bắt đầu lắng nghe bài giảng';
+      if (btn) {
+        btn.style.background = active
+          ? 'linear-gradient(135deg, #059669, #10b981)'
+          : 'linear-gradient(135deg, #e11d48, #f43f5e)';
+      }
+      if (liveBadge) liveBadge.style.display = active ? 'inline-flex' : 'none';
+      if (!active && interimBox) interimBox.style.display = 'none';
+    }
+
+    function updateInterimDisplay(pendingInterim) {
+      const interimBox = document.getElementById('interimSpeechDisplay');
+      if (!interimBox) return;
+      const clean = (pendingInterim || '').trim();
+      if (clean && isListeningRef) {
+        interimBox.innerHTML = `<span style="opacity: 0.78;"><i class="fa-solid fa-wave-square" style="margin-right: 6px; color: #38bdf8;"></i>Đang nhận âm:</span> <span style="color: #bae6fd;">${escapeHtmlSafe(clean)}...</span>`;
+        interimBox.style.display = 'block';
+      } else {
+        interimBox.style.display = 'none';
+      }
+    }
+
+    function computeRemainingSuffix(fullText, prefix) {
+      const fullClean = String(fullText || '').trim();
+      const prefClean = String(prefix || '').trim();
+      if (!fullClean) return '';
+      if (!prefClean) return fullClean;
+
+      const fullLower = fullClean.toLowerCase();
+      const prefLower = prefClean.toLowerCase();
+      if (fullLower.startsWith(prefLower)) {
+        return fullClean.slice(prefClean.length).trim();
+      }
+      // Nếu trình duyệt sửa nhẹ dấu/từ ở đoạn đầu sau khi đã flush interim, tách theo phần từ chưa xuất hiện
+      const prefWords = prefClean.split(/\s+/).filter(Boolean);
+      const fullWords = fullClean.split(/\s+/).filter(Boolean);
+      if (fullWords.length <= prefWords.length) {
+        return '';
+      }
+      let matchCount = 0;
+      const maxCheck = Math.min(prefWords.length, fullWords.length);
+      for (let i = 0; i < maxCheck; i++) {
+        if (fullWords[i].toLowerCase() === prefWords[i].toLowerCase()) {
+          matchCount++;
+        }
+      }
+      if (matchCount >= Math.max(1, Math.floor(prefWords.length * 0.6))) {
+        return fullWords.slice(prefWords.length).join(' ').trim();
+      }
+      return fullClean;
+    }
+
+    function commitLectureSentence(rawSentence) {
+      const clean = String(rawSentence || '').replace(/\s+/g, ' ').trim();
+      if (!clean) return;
+      const norm = clean.toLowerCase();
+      const now = Date.now();
+      // Chống lặp từ do Android Chrome emit trùng event khi restart
+      if (norm === lastCommittedNorm && (now - lastCommittedAt) < 3500) {
+        return;
+      }
+      lastCommittedNorm = norm;
+      lastCommittedAt = now;
+      enqueueLectureSentence(clean);
+    }
+
+    function flushInterimForTranslation() {
+      clearTimeout(interimPauseTimerId);
+      interimPauseTimerId = null;
+      const unFlushed = computeRemainingSuffix(currentInterimRaw, flushedInterimPrefix);
+      if (unFlushed && unFlushed.length >= 2) {
+        flushedInterimPrefix = currentInterimRaw.trim();
+        updateInterimDisplay('');
+        commitLectureSentence(unFlushed);
+      }
+    }
+
+    function createSpeechRecognitionInstance() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        showMicAlert('Trình duyệt hiện tại không hỗ trợ nhận dạng giọng nói trực tiếp (Web Speech API). Vui lòng mở bằng Google Chrome (Android/Desktop) hoặc Safari bản mới (iOS).');
+        return null;
+      }
+
+      const rec = new SpeechRecognition();
+      rec.lang = 'de-DE';
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+
+      rec.onstart = function() {
+        flushedInterimPrefix = '';
+        currentInterimRaw = '';
+        setMicUiActive(true, 'Đang nghe giảng (de-DE)...');
+      };
+
+      rec.onresult = function(event) {
+        let interimCombined = '';
+        let finalCombined = '';
+
+        // Chỉ xử lý từ event.resultIndex trở đi để tránh lặp lại toàn bộ lịch sử kết quả trên Android Chrome
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          const transcript = result && result[0] ? String(result[0].transcript || '') : '';
+          if (!transcript) continue;
+          if (result.isFinal === true) {
+            finalCombined += (finalCombined ? ' ' : '') + transcript;
+          } else {
+            interimCombined += (interimCombined ? ' ' : '') + transcript;
+          }
+        }
+
+        // Xử lý phần interim đang nói dở: hiển thị chữ nhạt tạm thời + kích hoạt ngắt câu khi có dấu câu hoặc im lặng 1.5s
+        if (interimCombined.trim()) {
+          currentInterimRaw = interimCombined.trim();
+          const unFlushedInterim = computeRemainingSuffix(currentInterimRaw, flushedInterimPrefix);
+          updateInterimDisplay(unFlushedInterim);
+
+          clearTimeout(interimPauseTimerId);
+          interimPauseTimerId = null;
+
+          if (unFlushedInterim.length >= 3 && /[.?!]\s*$/.test(unFlushedInterim)) {
+            flushInterimForTranslation();
+          } else if (unFlushedInterim.length >= 2) {
+            interimPauseTimerId = setTimeout(() => {
+              if (isListeningRef) {
+                flushInterimForTranslation();
+              }
+            }, 1500);
+          }
+        }
+
+        // Chỉ chốt chính thức khi isFinal === true (tránh lỗi nhân đôi từ trên Chrome Android)
+        if (finalCombined.trim()) {
+          clearTimeout(interimPauseTimerId);
+          interimPauseTimerId = null;
+          const remainingFinal = computeRemainingSuffix(finalCombined.trim(), flushedInterimPrefix);
+          flushedInterimPrefix = '';
+          currentInterimRaw = '';
+          updateInterimDisplay('');
+          if (remainingFinal) {
+            commitLectureSentence(remainingFinal);
+          }
+        }
+      };
+
+      rec.onerror = function(event) {
+        const errCode = event?.error || '';
+        console.warn('Speech recognition error:', errCode);
+
+        if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+          isListeningRef = false;
+          clearTimeout(restartTimeoutId);
+          clearTimeout(interimPauseTimerId);
+          setMicUiActive(false, 'Chưa cấp quyền Micro');
+          showMicAlert('Ứng dụng chưa được cấp quyền Microphone. Vui lòng bấm biểu tượng ổ khóa trên thanh địa chỉ trình duyệt và cho phép Microphone, sau đó thử lại.');
+        } else if (errCode === 'audio-capture') {
+          isListeningRef = false;
+          clearTimeout(restartTimeoutId);
+          setMicUiActive(false, 'Không tìm thấy Micro');
+          showMicAlert('Không phát hiện thấy thiết bị Microphone khả dụng. Vui lòng kiểm tra lại Micro trên thiết bị.');
+        } else if (errCode === 'network') {
+          if (document.getElementById('micStatusText')) {
+            document.getElementById('micStatusText').innerText = 'Đang thử kết nối lại nhận dạng âm thanh...';
+          }
+        }
+      };
+
+      rec.onend = function() {
+        clearTimeout(interimPauseTimerId);
+        interimPauseTimerId = null;
+        // Nếu vẫn còn đoạn interim dở khi trình duyệt di động tự ngắt phiên, đẩy nốt vào hàng đợi dịch
+        const dangling = computeRemainingSuffix(currentInterimRaw, flushedInterimPrefix);
+        if (dangling && dangling.length >= 2) {
+          commitLectureSentence(dangling);
+        }
+        currentInterimRaw = '';
+        flushedInterimPrefix = '';
+        updateInterimDisplay('');
+
+        if (isListeningRef) {
+          // Tự động khởi động lại sau 150ms trên mobile/desktop khi trình duyệt tự ngắt continuous
+          clearTimeout(restartTimeoutId);
+          restartTimeoutId = setTimeout(() => {
+            if (!isListeningRef) return;
+            try {
+              if (!recognition) {
+                recognition = createSpeechRecognitionInstance();
+              }
+              if (recognition) {
+                recognition.start();
+              }
+            } catch (err) {
+              // Nếu phiên cũ trên mobile kẹt trạng thái, tạo lại instance mới ngay lập tức
+              recognition = createSpeechRecognitionInstance();
+              if (recognition) {
+                try {
+                  recognition.start();
+                } catch (retryErr) {
+                  console.warn('Speech recognition restart failed:', retryErr);
+                }
+              }
+            }
+          }, 150);
+        } else {
+          setMicUiActive(false, 'Đã tạm dừng');
+        }
+      };
+
+      return rec;
+    }
+
+    async function ensureMobileMicPermission() {
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+        return true;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Giải phóng ngay luồng audio thô để SpeechRecognition không bị xung đột chiếm Micro trên Android/iOS
+        stream.getTracks().forEach((track) => track.stop());
+        hideMicAlert();
+        return true;
+      } catch (err) {
+        const name = err?.name || '';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          showMicAlert('Bạn chưa cấp quyền Microphone. Vui lòng chọn "Cho phép" (Allow) trong hộp thoại hoặc bật quyền Micro trong cài đặt trình duyệt.');
+        } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+          showMicAlert('Không tìm thấy Microphone trên thiết bị của bạn.');
+        } else {
+          showMicAlert(`Không thể mở Microphone: ${err?.message || 'Lỗi thiết bị âm thanh.'}`);
+        }
+        setMicUiActive(false, 'Chưa cấp quyền Micro');
+        return false;
+      }
+    }
+
+    async function toggleClassroomListen() {
+      if (!isListeningRef) {
+        hideMicAlert();
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+          showMicAlert('Trình duyệt không hỗ trợ Web Speech API. Trên điện thoại Android hãy dùng Chrome; trên máy tính dùng Chrome hoặc Edge.');
+          return;
+        }
+
+        // Bắt buộc gọi getUserMedia({ audio: true }) trước để hiện popup xin quyền Micro chuẩn trên Android/iOS
+        setMicUiActive(false, 'Đang xin quyền Micro...');
+        const granted = await ensureMobileMicPermission();
+        if (!granted) {
+          isListeningRef = false;
+          return;
+        }
+
+        if (!recognition) {
+          recognition = createSpeechRecognitionInstance();
+        }
+        if (!recognition) return;
+
+        isListeningRef = true;
         try {
           recognition.start();
-        } catch(e) {
-          try { recognition.stop(); setTimeout(() => recognition.start(), 200); } catch(err) {}
+        } catch (err) {
+          recognition = createSpeechRecognitionInstance();
+          if (recognition) {
+            try {
+              recognition.start();
+            } catch (startErr) {
+              isListeningRef = false;
+              setMicUiActive(false, 'Lỗi khởi động Micro');
+              showMicAlert('Không thể khởi động nhận dạng giọng nói. Vui lòng thử bấm lại.');
+            }
+          }
         }
       } else {
-        isClassroomListening = false;
-        try { recognition.stop(); } catch(e) {}
-        document.getElementById('micLed').style.background = '#64748b';
-        document.getElementById('micStatusText').innerText = 'Đã tạm dừng';
-        document.getElementById('recBtnText').innerText = 'Bắt đầu lắng nghe bài giảng';
-        if (liveBadge) liveBadge.style.display = 'none';
-        if (interimBox) interimBox.style.display = 'none';
+        isListeningRef = false;
+        clearTimeout(restartTimeoutId);
+        clearTimeout(interimPauseTimerId);
+        restartTimeoutId = null;
+        interimPauseTimerId = null;
+
+        const dangling = computeRemainingSuffix(currentInterimRaw, flushedInterimPrefix);
+        if (dangling && dangling.length >= 2) {
+          commitLectureSentence(dangling);
+        }
+        currentInterimRaw = '';
+        flushedInterimPrefix = '';
+
+        if (recognition) {
+          try {
+            recognition.stop();
+          } catch (e) {}
+        }
+        setMicUiActive(false, 'Đã tạm dừng');
       }
     }
 
@@ -2332,99 +2588,207 @@
       try {
         const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=de&tl=vi&dt=t&q=${encodeURIComponent(germanText)}`;
         const res = await fetch(url);
-        const data = await res.json();
-        if (data && data[0]) {
-          let vi = "";
-          data[0].forEach(seg => { if (seg && seg[0]) vi += seg[0]; });
-          return vi || "Không thể dịch.";
+        if (!res.ok) {
+          return { ok: false, error: `Lỗi dịch (${res.status})` };
         }
-        return "Không có bản dịch.";
+        const data = await res.json();
+        const translation = Array.isArray(data && data[0])
+          ? data[0].map((item) => (item && item[0] ? item[0] : '')).join('').trim()
+          : '';
+        if (!translation) {
+          return { ok: false, error: 'Không có bản dịch.' };
+        }
+        return { ok: true, translation };
       } catch (err) {
-        return "Lỗi kết nối dịch.";
+        return { ok: false, error: 'Lỗi kết nối dịch.' };
       }
     }
 
-    async function appendAndTranslateLectureSentence(deSentence) {
-      const articleBox = document.getElementById('vietnameseArticleBox');
-      const germanStream = document.getElementById('liveGermanStream');
-      const vietStream = document.getElementById('liveVietStream');
-
-      const emptyNotice = articleBox.querySelector('p');
-      if (emptyNotice) articleBox.innerHTML = '';
-      if (germanStream && germanStream.querySelector('p')) germanStream.innerHTML = '';
-      if (vietStream && vietStream.querySelector('p')) vietStream.innerHTML = '';
-
-      const timeStr = new Date().toLocaleTimeString();
-      const viTranslation = await translateGermanToVietnamese(deSentence);
-      lectureHistory.push({ time: timeStr, de: deSentence, vi: viTranslation });
-
-      // 1. Cập nhật Ô Tiếng Đức (Giáo viên nói)
-      if (germanStream) {
-        const pDe = document.createElement('div');
-        pDe.style.cssText = "margin-bottom: 10px; padding: 10px 14px; background: rgba(255,255,255,0.05); border-radius: 12px; border-left: 3px solid #38bdf8;";
-        pDe.innerHTML = `<span style="font-size:0.75rem; color:#64748b; display:block; margin-bottom:2px;"><i class="fa-regular fa-clock"></i> ${timeStr}</span><span style="color:#fff; font-weight:500;">${deSentence}</span>`;
-        germanStream.appendChild(pDe);
-        germanStream.scrollTop = germanStream.scrollHeight;
+    function renderArticleSlotContent(articleEl, deSentence, viText, isError) {
+      if (!articleEl) return;
+      if (isError) {
+        articleEl.innerHTML = `<span style="color:#fca5a5; font-style:italic; font-size:0.9rem;"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtmlSafe(viText)}</span>`;
+        return;
       }
-
-      // 2. Cập nhật Ô Tiếng Việt (Dịch tự động song song)
-      if (vietStream) {
-        const pVi = document.createElement('div');
-        pVi.style.cssText = "margin-bottom: 10px; padding: 10px 14px; background: rgba(255,255,255,0.05); border-radius: 12px; border-left: 3px solid #34d399;";
-        pVi.innerHTML = `<span style="font-size:0.75rem; color:#64748b; display:block; margin-bottom:2px;"><i class="fa-regular fa-clock"></i> ${timeStr}</span><span style="color:#a7f3d0; font-weight:500;">${viTranslation}</span>`;
-        vietStream.appendChild(pVi);
-        vietStream.scrollTop = vietStream.scrollHeight;
-      }
-
-      // 3. Cập nhật Bản dịch tiếng Việt (Tổng Hợp Liền Mạch Dạng Văn Bản)
       const lower = deSentence.toLowerCase();
-      const isExam = EXAM_KEYWORDS.some(kw => lower.includes(kw));
-
-      const div = document.createElement('div');
-      div.style.cssText = "margin-bottom: 16px; line-height: 1.85; text-align: justify;";
-
+      const isExam = EXAM_KEYWORDS.some((kw) => lower.includes(kw));
       if (isExam) {
-        div.innerHTML = `
+        articleEl.innerHTML = `
           <div style="font-size: 0.8rem; font-weight: 800; color: #f87171; margin-bottom: 4px;">
             <i class="fa-solid fa-triangle-exclamation"></i> [LƯU Ý GIÁO VIÊN DẶN THI CỬ / BÀI TẬP]:
           </div>
           <div style="background: rgba(239, 68, 68, 0.16); padding: 8px 12px; border-radius: 10px; border-left: 3px solid #ef4444; color: #fecdd3;">
-            “${viTranslation}”
+            “${escapeHtmlSafe(viText)}”
           </div>
         `;
       } else {
-        div.innerHTML = `“${viTranslation}”`;
+        articleEl.innerHTML = `“${escapeHtmlSafe(viText)}”`;
+      }
+    }
+
+    function enqueueLectureSentence(deSentence) {
+      const articleBox = document.getElementById('vietnameseArticleBox');
+      const germanStream = document.getElementById('liveGermanStream');
+      const vietStream = document.getElementById('liveVietStream');
+
+      if (articleBox) {
+        const emptyNotice = articleBox.querySelector('p');
+        if (emptyNotice) articleBox.innerHTML = '';
+      }
+      if (germanStream && germanStream.querySelector('p')) germanStream.innerHTML = '';
+      if (vietStream && vietStream.querySelector('p')) vietStream.innerHTML = '';
+
+      const timeStr = new Date().toLocaleTimeString();
+      const historyIdx = lectureHistory.length;
+      const sessionSnapshot = liveSessionCounter;
+      lectureHistory.push({ time: timeStr, de: deSentence, vi: 'Đang dịch...' });
+
+      // 1. Hiển thị ngay câu tiếng Đức giáo viên vừa nói
+      if (germanStream) {
+        const pDe = document.createElement('div');
+        pDe.style.cssText = 'margin-bottom: 10px; padding: 10px 14px; background: rgba(255,255,255,0.05); border-radius: 12px; border-left: 3px solid #38bdf8;';
+        pDe.innerHTML = `<span style="font-size:0.75rem; color:#64748b; display:block; margin-bottom:2px;"><i class="fa-regular fa-clock"></i> ${escapeHtmlSafe(timeStr)}</span><span style="color:#fff; font-weight:500;">${escapeHtmlSafe(deSentence)}</span>`;
+        germanStream.appendChild(pDe);
+        germanStream.scrollTop = germanStream.scrollHeight;
       }
 
-      articleBox.appendChild(div);
-      articleBox.scrollTop = articleBox.scrollHeight;
+      // 2. Tạo ngay dòng chờ "Đang dịch..." bên cột Tiếng Việt
+      let viTextSpan = null;
+      if (vietStream) {
+        const pVi = document.createElement('div');
+        pVi.style.cssText = 'margin-bottom: 10px; padding: 10px 14px; background: rgba(255,255,255,0.05); border-radius: 12px; border-left: 3px solid #34d399;';
+        const timeEl = document.createElement('span');
+        timeEl.style.cssText = 'font-size:0.75rem; color:#64748b; display:block; margin-bottom:2px;';
+        timeEl.innerHTML = `<i class="fa-regular fa-clock"></i> ${escapeHtmlSafe(timeStr)}`;
+        viTextSpan = document.createElement('span');
+        viTextSpan.style.cssText = 'color:#94a3b8; font-style:italic; font-weight:500;';
+        viTextSpan.innerHTML = `<i class="fa-solid fa-circle-notch fa-spin" style="margin-right:6px; color:#34d399;"></i>Đang dịch...`;
+        pVi.appendChild(timeEl);
+        pVi.appendChild(viTextSpan);
+        vietStream.appendChild(pVi);
+        vietStream.scrollTop = vietStream.scrollHeight;
+      }
+
+      // 3. Tạo ngay dòng chờ "Đang dịch..." ở khung Bản dịch tiếng Việt liền mạch
+      let articleSlot = null;
+      if (articleBox) {
+        articleSlot = document.createElement('div');
+        articleSlot.style.cssText = 'margin-bottom: 16px; line-height: 1.85; text-align: justify;';
+        articleSlot.innerHTML = `<span style="color:#94a3b8; font-style:italic;"><i class="fa-solid fa-circle-notch fa-spin" style="margin-right:6px; color:#34d399;"></i>Đang dịch...</span>`;
+        articleBox.appendChild(articleSlot);
+        articleBox.scrollTop = articleBox.scrollHeight;
+      }
+
+      translationQueue.push({
+        sessionSnapshot,
+        historyIdx,
+        deSentence,
+        viTextSpan,
+        articleSlot,
+        vietStream,
+        articleBox,
+      });
+      processTranslationQueue();
+    }
+
+    async function processTranslationQueue() {
+      if (isProcessingQueue) return;
+      isProcessingQueue = true;
+      try {
+        while (translationQueue.length > 0) {
+          const job = translationQueue.shift();
+          if (!job || job.sessionSnapshot !== liveSessionCounter) continue;
+
+          const result = await translateGermanToVietnamese(job.deSentence);
+          if (job.sessionSnapshot !== liveSessionCounter) continue;
+
+          if (result.ok) {
+            if (lectureHistory[job.historyIdx]) {
+              lectureHistory[job.historyIdx].vi = result.translation;
+            }
+            if (job.viTextSpan) {
+              job.viTextSpan.style.cssText = 'color:#a7f3d0; font-weight:500;';
+              job.viTextSpan.textContent = result.translation;
+            }
+            renderArticleSlotContent(job.articleSlot, job.deSentence, result.translation, false);
+          } else {
+            if (lectureHistory[job.historyIdx]) {
+              lectureHistory[job.historyIdx].vi = `[${result.error}]`;
+            }
+            if (job.viTextSpan) {
+              job.viTextSpan.style.cssText = 'color:#fca5a5; font-style:italic;';
+              job.viTextSpan.textContent = result.error;
+            }
+            renderArticleSlotContent(job.articleSlot, job.deSentence, result.error, true);
+          }
+
+          if (job.vietStream) job.vietStream.scrollTop = job.vietStream.scrollHeight;
+          if (job.articleBox) job.articleBox.scrollTop = job.articleBox.scrollHeight;
+        }
+      } finally {
+        isProcessingQueue = false;
+        if (translationQueue.length > 0) {
+          processTranslationQueue();
+        }
+      }
+    }
+
+    function appendAndTranslateLectureSentence(deSentence) {
+      commitLectureSentence(deSentence);
     }
 
     function copyPureVietnameseText() {
-      if (!lectureHistory.length) { alert("Chưa có nội dung dịch nào!"); return; }
-      let fullText = "1. Bản dịch tiếng Việt\nGiáo viên:\n\n";
-      lectureHistory.forEach(item => { fullText += `“${item.vi}”\n\n`; });
+      if (!lectureHistory.length) {
+        showAppToast('Chưa có nội dung dịch nào!', 'removed');
+        return;
+      }
+      let fullText = '1. Bản dịch tiếng Việt\nGiáo viên:\n\n';
+      lectureHistory.forEach((item) => {
+        fullText += `“${item.vi}”\n\n`;
+      });
       navigator.clipboard.writeText(fullText);
-      alert("Đã sao chép toàn bộ văn bản tiếng Việt!");
+      showAppToast('Đã sao chép toàn bộ văn bản tiếng Việt!', 'saved');
     }
 
     function clearLiveTransHistory() {
-      document.getElementById('vietnameseArticleBox').innerHTML = `<p style="color: #64748b; font-style: italic;">Đã xóa bảng dịch. Hãy bật mic để nghe giảng...</p>`;
+      liveSessionCounter++;
+      translationQueue.length = 0;
+      clearTimeout(interimPauseTimerId);
+      interimPauseTimerId = null;
+      currentInterimRaw = '';
+      flushedInterimPrefix = '';
+      lastCommittedNorm = '';
+      lastCommittedAt = 0;
+      updateInterimDisplay('');
+
+      const articleBox = document.getElementById('vietnameseArticleBox');
+      if (articleBox) {
+        articleBox.innerHTML = `<p style="color: #64748b; font-style: italic;">Đã xóa bảng dịch. Hãy bật mic để nghe giảng...</p>`;
+      }
       const germanStream = document.getElementById('liveGermanStream');
       const vietStream = document.getElementById('liveVietStream');
-      if (germanStream) germanStream.innerHTML = `<p style="color: #64748b; font-style: italic;">Nhấn nút "Bắt đầu lắng nghe bài giảng" và để thiết bị gần giáo viên...</p>`;
-      if (vietStream) vietStream.innerHTML = `<p style="color: #64748b; font-style: italic;">Bản dịch tiếng Việt tương ứng sẽ tự động cập nhật ngay khi giáo viên dứt từng câu giảng.</p>`;
+      if (germanStream) {
+        germanStream.innerHTML = `<p style="color: #64748b; font-style: italic;">Nhấn nút "Bắt đầu lắng nghe bài giảng" và để thiết bị gần giáo viên...</p>`;
+      }
+      if (vietStream) {
+        vietStream.innerHTML = `<p style="color: #64748b; font-style: italic;">Bản dịch tiếng Việt tương ứng sẽ tự động cập nhật ngay khi giáo viên dứt từng câu giảng.</p>`;
+      }
       lectureHistory = [];
     }
 
     function exportLectureNotes() {
-      if (!lectureHistory.length) { alert("Chưa có ghi chép nào!"); return; }
-      let content = "=== GHI CHÉP BÀI GIẢNG TIẾNG ĐỨC ===\n\n";
-      lectureHistory.forEach((it, i) => { content += `[${it.time}] Câu ${i + 1}:\nDE: ${it.de}\nVI: ${it.vi}\n\n`; });
-      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-      const a = document.createElement("a");
+      if (!lectureHistory.length) {
+        showAppToast('Chưa có ghi chép nào!', 'removed');
+        return;
+      }
+      let content = '=== GHI CHÉP BÀI GIẢNG TIẾNG ĐỨC ===\n\n';
+      lectureHistory.forEach((it, i) => {
+        content += `[${it.time}] Câu ${i + 1}:\nDE: ${it.de}\nVI: ${it.vi}\n\n`;
+      });
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `BaiGiang_${new Date().toISOString().slice(0,10)}.txt`;
+      a.download = `BaiGiang_${new Date().toISOString().slice(0, 10)}.txt`;
       a.click();
     }
 
@@ -2458,7 +2822,7 @@
         showAppToast('Chưa có nội dung bài giảng nào để tóm tắt!', 'removed');
         return;
       }
-      if (isClassroomListening) toggleClassroomListen();
+      if (isListeningRef) await toggleClassroomListen();
 
       const summaryBox = document.getElementById('lectureSummaryBox');
       const loadingEl = document.getElementById('summaryLoadingState');

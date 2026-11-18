@@ -685,69 +685,91 @@ Nguyên tắc bắt buộc:
 - Nếu có đoạn nội dung không rõ hoặc mơ hồ, đánh dấu rõ là [Không rõ / Cần kiểm tra lại].
 - Nếu trong bài giảng có nhắc lịch thi, kiểm tra, bài tập về nhà, hạn nộp hay lưu ý đặc biệt (Prüfung, Test, Klausur, Hausaufgabe, Termin...), liệt kê ngắn gọn vào mảng examAlerts.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Phân tích nội dung bài học dưới đây và trả về JSON theo đúng schema:\n\n${contentBlock}`,
-        config: {
-          systemInstruction,
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              examAlerts: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: 'Các lưu ý về thi cử, kiểm tra, bài tập về nhà nếu có trong bài.',
-              },
-              zusammenfassung: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '3 đến 7 gạch đầu dòng tóm tắt ý chính theo trình tự logic.',
-              },
-              wichtigeInformationen: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    point: {
-                      type: Type.STRING,
-                      description: 'Kiến thức, nguyên tắc, quy trình, số liệu, thời gian, điều kiện hoặc ví dụ quan trọng.',
-                    },
-                    sourceTag: {
-                      type: Type.STRING,
-                      description: 'Ghi rõ "Trong bài giảng" hoặc "Bổ sung".',
-                    },
-                  },
-                  required: ['point', 'sourceTag'],
+      const summarySchema = {
+        type: Type.OBJECT,
+        properties: {
+          examAlerts: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: 'Các lưu ý về thi cử, kiểm tra, bài tập về nhà nếu có trong bài.',
+          },
+          zusammenfassung: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description: '3 đến 7 gạch đầu dòng tóm tắt ý chính theo trình tự logic.',
+          },
+          wichtigeInformationen: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                point: {
+                  type: Type.STRING,
+                  description: 'Kiến thức, nguyên tắc, quy trình, số liệu, thời gian, điều kiện hoặc ví dụ quan trọng.',
+                },
+                sourceTag: {
+                  type: Type.STRING,
+                  description: 'Ghi rõ "Trong bài giảng" hoặc "Bổ sung".',
                 },
               },
-              wortschatz: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    term: {
-                      type: Type.STRING,
-                      description: 'Từ vựng / Thuật ngữ gốc (kèm Artikel der/die/das nếu là danh từ).',
-                    },
-                    meaningVi: {
-                      type: Type.STRING,
-                      description: 'Nghĩa tiếng Việt.',
-                    },
-                    note: {
-                      type: Type.STRING,
-                      description: 'Ngữ cảnh / Ghi chú ngắn.',
-                    },
-                  },
-                  required: ['term', 'meaningVi', 'note'],
-                },
-              },
+              required: ['point', 'sourceTag'],
             },
-            required: ['examAlerts', 'zusammenfassung', 'wichtigeInformationen', 'wortschatz'],
+          },
+          wortschatz: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                term: {
+                  type: Type.STRING,
+                  description: 'Từ vựng / Thuật ngữ gốc (kèm Artikel der/die/das nếu là danh từ).',
+                },
+                meaningVi: {
+                  type: Type.STRING,
+                  description: 'Nghĩa tiếng Việt.',
+                },
+                note: {
+                  type: Type.STRING,
+                  description: 'Ngữ cảnh / Ghi chú ngắn.',
+                },
+              },
+              required: ['term', 'meaningVi', 'note'],
+            },
           },
         },
-      });
+        required: ['examAlerts', 'zusammenfassung', 'wichtigeInformationen', 'wortschatz'],
+      };
+
+      const promptContents = `Phân tích nội dung bài học dưới đây và trả về JSON theo đúng schema:\n\n${contentBlock}`;
+      let response;
+      try {
+        response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: promptContents,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: summarySchema,
+          },
+        });
+      } catch (primaryErr: any) {
+        const errStatus = primaryErr?.status;
+        const msg = String(primaryErr?.message || '');
+        if (errStatus === 404 || msg.includes('NOT_FOUND') || msg.includes('not found')) {
+          response = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: promptContents,
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              responseMimeType: 'application/json',
+              responseSchema: summarySchema,
+            },
+          });
+        } else {
+          throw primaryErr;
+        }
+      }
 
       const rawJson = (response.text || '').trim();
       if (!rawJson) {
